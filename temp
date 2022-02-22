@@ -1,0 +1,207 @@
+from __future__ import print_function, division
+from torch.utils.data import Dataset, DataLoader
+import scipy.io as scp
+import numpy as np
+import torch
+from matplotlib import pyplot as plt
+from scipy.stats.stats import pearsonr
+from nltk.tokenize import sent_tokenize, word_tokenize 
+import shutil
+import string
+from transformers import BertTokenizer, BertForSequenceClassification, BertModel, LongformerTokenizer
+from transformers import LongformerConfig, LongformerModel
+import spacy
+nlp = spacy.load("en_core_web_sm")
+import dgl
+from dgl import DGLGraph
+from dgl.data import MiniGCDataset
+import dgl.function as fn
+import json
+
+
+use_cuda = False #torch.cuda.is_available()
+device= torch.device('cuda:1' if use_cuda else 'cpu')
+device_ids = [1]
+
+BERT_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+BERT_model = BertModel.from_pretrained('bert-base-uncased')
+
+batch_size=1
+epochs=10
+lr=2e-5
+num_warm_steps=100
+torch.manual_seed(0)
+np.random.seed(0)
+
+data_path="/home/puneetm/tdg/data/"
+tdg_data="tdg_data/"
+train_folder="train/"
+test_folder="test/"
+val_folder="val/"
+model_save_path="/home/puneetm/tdg/trained_models/"
+
+train=[]
+test=[]
+val=[]
+
+class TMLDataset(Dataset):
+
+
+    def __init__(self, data):
+        self.data = data
+        self.num_samples = len(list(self.data))
+
+        with open('./data/TDDiscourse/rst_data.json') as f:
+            rst_data = json.load(f)
+            self.rst_data=rst_data
+        with open('./data/TDDiscourse/TimeBank_sent_file_dict.json') as f:
+            sent_file_dict = json.load(f)
+            self.sent_file_dict=sent_file_dict
+
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+
+        label_dict={'AFTER':0, 'BEFORE':1, 'IS_INCLUDED':2, 'INCLUDES':3, 'SIMULTANEOUS':4}
+        y_label = label_dict[self.data[idx]["rel"]]
+
+        token_dict_list=self.data[idx]['token_dict_list']
+        sent_dict_list=self.data[idx]['sent_dict_list']
+        doc_dict_list=self.data[idx]['doc_dict_list']
+
+
+
+def calculate_loss(tdg_link, tdg_rel, target_link, target_rel):
+    NLLloss_rel=nn.NLLLoss()
+    NLLloss_link=nn.NLLLoss()
+
+    target_rel = target_rel.long()
+    target_link = target_link.long()
+
+    loss_rel=NLLloss_rel(tdg_rel,target_rel)
+    loss_link=NLLloss_link(tdg_link,target_link)
+    total_loss = loss_link + loss_rel
+
+    return loss_rel, loss_link, total_loss
+
+trainSet=TDGraph(train)
+valSet=TDGraph(val) 
+testSet=TDGraph(test)
+
+trainDataLoader=DataLoader(trainSet, batch_size=batch_size, shuffle=False)
+valDataLoader=DataLoader(valSet, batch_size=batch_size, shuffle=False)
+testDataLoader=DataLoader(valSet, batch_size=batch_size, shuffle=False)
+
+def training(trainLoader, model, optimizer, scheduler):
+    count=0
+    
+    softmax = nn.LogSoftmax(dim=0)
+    total_train_loss = 0
+    total_loss_rel = 0
+    total_loss_link = 0
+    model = model.train()
+    model.zero_grad()
+
+    for iter, data in enumerate(trainLoader):
+        try:
+            g_syntactical=data[0].to(device)
+            rel_syntactic=data[1].to(device)
+            g_structural=data[2].to(device)
+            rel_structural=data[3].to(device)
+            # input_ids=data[4].to(device)
+            # node_type=data[5].to(device)
+            node_type_TE=data[6].to(device)
+            target_link = data[7].to(device)
+            target_rel = data[8].to(device)
+
+
+            tdg_link, tdg_rel = model(g_syntactical, rel_syntactic, g_structural, rel_structural, node_type_TE, device)
+            tdg_link=softmax(tdg_link)
+            tdg_rel=softmax(tdg_rel)
+            loss_rel, loss_link, loss = calculate_loss(tdg_link, tdg_rel, target_link, target_rel)
+            
+            loss=loss.to(torch.float32)
+            batch_loss = loss.item()
+            total_train_loss += batch_loss
+
+            loss_link=loss_link.to(torch.float32)
+            batch_loss_link = loss_link.item()
+            total_loss_link += batch_loss_link
+
+            loss_rel=loss_rel.to(torch.float32)
+            batch_loss_rel = loss_rel.item()
+            total_loss_rel += batch_loss_rel
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+        except:
+            count=count+1
+            pass   
+
+    avg_train_loss = total_train_loss / len(trainLoader)
+    print(total_loss_link, total_loss_rel)
+    print(count)
+    return avg_train_loss
+    
+
+
+
+def evaluation(valLoader, model, optimizer, scheduler):
+    
+    total_val_loss = 0
+    model = model.eval()
+    with tqdm(valLoader, unit="batch") as tepoch:
+        for data in tepoch:
+            with torch.no_grad():
+                input= data['data'].to(device)
+                output = model(input = input)
+                loss=calculate_loss()
+                loss=loss.to(torch.float32)
+                
+                batch_loss = loss.item()
+                total_val_loss += batch_loss
+
+    avg_val_loss = total_val_loss / len(valLoader)
+    return avg_val_loss
+
+num_relations=6
+model=TDGParser(num_relations).to(device)
+if use_cuda:
+    model = DataParallel(model,device_ids=device_ids)
+model.to(device)
+
+total_steps = len(trainDataLoader) * epochs
+optimizer = AdamW(model.parameters(), lr=lr)
+scheduler = get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=num_warm_steps,
+  num_training_steps=total_steps
+)
+
+training_stats=[]
+best_val_loss=float('inf')
+for epoch in range(epochs):
+    print(f'Epoch {epoch + 1}/{epochs}')
+    train_loss = training(trainDataLoader, model, optimizer, scheduler)
+    print(f'Train loss {train_loss}')
+    val_loss = evaluation(valDataLoader, model, optimizer, scheduler)
+    print(f'Val loss {val_loss} ')
+
+    training_stats.append(
+        {
+            'epoch': epoch + 1,
+            'Training Loss': train_loss,
+            'Valid. Loss': val_loss,
+        })
+    
+    if(epoch==0):
+        best_val_loss=val_loss
+
+    if val_loss <= best_val_loss:
+        torch.save(model.state_dict(), model_save_path+ "TDGParser.bin")
+        best_val_loss = val_loss
+
